@@ -1,0 +1,292 @@
+from flask import Flask, request, jsonify
+from flask_sqlalchemy import SQLAlchemy
+from flask_jwt_extended import JWTManager, create_access_token, jwt_required, get_jwt_identity
+from datetime import datetime, timedelta
+import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
+import numpy as np
+import bcrypt
+
+app = Flask(__name__)
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///thalassemia_care.db'
+app.config['JWT_SECRET_KEY'] = 'your-secret-key-here'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+db = SQLAlchemy(app)
+jwt = JWTManager(app)
+
+# Database Models
+class Patient(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    phone = db.Column(db.String(15), nullable=False)
+    blood_type = db.Column(db.String(5), nullable=False)
+    age = db.Column(db.Integer, nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    next_transfusion = db.Column(db.DateTime, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class Donor(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=False)
+    phone = db.Column(db.String(15), nullable=False)
+    blood_type = db.Column(db.String(5), nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+    last_donation = db.Column(db.DateTime)
+    donation_count = db.Column(db.Integer, default=0)
+    is_available = db.Column(db.Boolean, default=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class BloodRequest(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patient.id'), nullable=False)
+    blood_type = db.Column(db.String(5), nullable=False)
+    units_needed = db.Column(db.Integer, nullable=False)
+    urgency_level = db.Column(db.String(20), nullable=False)  # low, medium, high, critical
+    location = db.Column(db.String(100), nullable=False)
+    required_by = db.Column(db.DateTime, nullable=False)
+    status = db.Column(db.String(20), default='pending')  # pending, matched, fulfilled
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class DonationHistory(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    donor_id = db.Column(db.Integer, db.ForeignKey('donor.id'), nullable=False)
+    patient_id = db.Column(db.Integer, db.ForeignKey('patient.id'), nullable=False)
+    donation_date = db.Column(db.DateTime, nullable=False)
+    units_donated = db.Column(db.Integer, nullable=False)
+    location = db.Column(db.String(100), nullable=False)
+
+# AI-Powered Donor Prediction
+class DonorPredictor:
+    def __init__(self):
+        self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+        self.is_trained = False
+    
+    def prepare_features(self, donor_data):
+        """Convert donor data to features for ML model"""
+        features = []
+        for donor in donor_data:
+            # Feature engineering based on donation patterns
+            days_since_last = (datetime.utcnow() - donor.last_donation).days if donor.last_donation else 365
+            donation_frequency = donor.donation_count / max(1, (datetime.utcnow() - donor.created_at).days / 30)
+            
+            features.append([
+                days_since_last,
+                donation_frequency,
+                donor.donation_count,
+                1 if donor.is_available else 0
+            ])
+        return np.array(features)
+    
+    def train_model(self):
+        """Train the model using historical donation data"""
+        donors = Donor.query.all()
+        if len(donors) < 10:  # Need minimum data
+            return False
+            
+        X = self.prepare_features(donors)
+        # Target: probability of donation in next 7 days (simplified)
+        y = [min(1.0, donor.donation_count / 10) for donor in donors]
+        
+        self.model.fit(X, y)
+        self.is_trained = True
+        return True
+    
+    def predict_availability(self, blood_type, location, days_ahead=7):
+        """Predict donor availability for specific blood type and location"""
+        if not self.is_trained:
+            self.train_model()
+        
+        compatible_donors = Donor.query.filter_by(
+            blood_type=blood_type,
+            location=location,
+            is_available=True
+        ).all()
+        
+        if not compatible_donors:
+            return []
+        
+        X = self.prepare_features(compatible_donors)
+        predictions = self.model.predict(X)
+        
+        # Combine predictions with donor info
+        results = []
+        for i, donor in enumerate(compatible_donors):
+            results.append({
+                'donor_id': donor.id,
+                'name': donor.name,
+                'availability_score': float(predictions[i]),
+                'last_donation': donor.last_donation.isoformat() if donor.last_donation else None,
+                'donation_count': donor.donation_count
+            })
+        
+        return sorted(results, key=lambda x: x['availability_score'], reverse=True)
+
+# Initialize predictor
+predictor = DonorPredictor()
+
+# API Routes
+@app.route('/api/register/patient', methods=['POST'])
+def register_patient():
+    data = request.get_json()
+    
+    patient = Patient(
+        name=data['name'],
+        email=data['email'],
+        phone=data['phone'],
+        blood_type=data['blood_type'],
+        age=data['age'],
+        location=data['location'],
+        next_transfusion=datetime.fromisoformat(data['next_transfusion'])
+    )
+    
+    db.session.add(patient)
+    db.session.commit()
+    
+    return jsonify({'message': 'Patient registered successfully', 'patient_id': patient.id}), 201
+
+@app.route('/api/register/donor', methods=['POST'])
+def register_donor():
+    data = request.get_json()
+    
+    donor = Donor(
+        name=data['name'],
+        email=data['email'],
+        phone=data['phone'],
+        blood_type=data['blood_type'],
+        location=data['location']
+    )
+    
+    db.session.add(donor)
+    db.session.commit()
+    
+    return jsonify({'message': 'Donor registered successfully', 'donor_id': donor.id}), 201
+
+@app.route('/api/blood-request', methods=['POST'])
+@jwt_required()
+def create_blood_request():
+    data = request.get_json()
+    patient_id = get_jwt_identity()
+    
+    blood_request = BloodRequest(
+        patient_id=patient_id,
+        blood_type=data['blood_type'],
+        units_needed=data['units_needed'],
+        urgency_level=data['urgency_level'],
+        location=data['location'],
+        required_by=datetime.fromisoformat(data['required_by'])
+    )
+    
+    db.session.add(blood_request)
+    db.session.commit()
+    
+    # Trigger donor matching
+    matches = match_donors(blood_request)
+    
+    return jsonify({
+        'message': 'Blood request created successfully',
+        'request_id': blood_request.id,
+        'potential_matches': len(matches)
+    }), 201
+
+@app.route('/api/predict-donors', methods=['POST'])
+def predict_donors():
+    data = request.get_json()
+    
+    predictions = predictor.predict_availability(
+        blood_type=data['blood_type'],
+        location=data['location'],
+        days_ahead=data.get('days_ahead', 7)
+    )
+    
+    return jsonify({
+        'predicted_donors': predictions,
+        'count': len(predictions)
+    })
+
+@app.route('/api/match-donors/<int:request_id>', methods=['GET'])
+def get_donor_matches(request_id):
+    blood_request = BloodRequest.query.get_or_404(request_id)
+    matches = match_donors(blood_request)
+    
+    return jsonify({
+        'matches': matches,
+        'request_details': {
+            'blood_type': blood_request.blood_type,
+            'units_needed': blood_request.units_needed,
+            'urgency': blood_request.urgency_level,
+            'required_by': blood_request.required_by.isoformat()
+        }
+    })
+
+def match_donors(blood_request):
+    """Find compatible donors for a blood request"""
+    # Blood compatibility matrix
+    compatibility = {
+        'O-': ['O+', 'A+', 'B+', 'AB+', 'O-', 'A-', 'B-', 'AB-'],
+        'O+': ['O+', 'A+', 'B+', 'AB+'],
+        'A-': ['A+', 'A-', 'AB+', 'AB-'],
+        'A+': ['A+', 'AB+'],
+        'B-': ['B+', 'B-', 'AB+', 'AB-'],
+        'B+': ['B+', 'AB+'],
+        'AB-': ['AB+', 'AB-'],
+        'AB+': ['AB+']
+    }
+    
+    compatible_types = []
+    for donor_type, can_donate_to in compatibility.items():
+        if blood_request.blood_type in can_donate_to:
+            compatible_types.append(donor_type)
+    
+    # Find available donors
+    available_donors = Donor.query.filter(
+        Donor.blood_type.in_(compatible_types),
+        Donor.location == blood_request.location,
+        Donor.is_available == True
+    ).all()
+    
+    # Get AI predictions for these donors
+    predictions = predictor.predict_availability(
+        blood_request.blood_type,
+        blood_request.location
+    )
+    
+    return predictions[:10]  # Return top 10 matches
+
+@app.route('/api/dashboard/patient/<int:patient_id>', methods=['GET'])
+@jwt_required()
+def patient_dashboard(patient_id):
+    patient = Patient.query.get_or_404(patient_id)
+    
+    # Get upcoming transfusions
+    upcoming_requests = BloodRequest.query.filter_by(
+        patient_id=patient_id,
+        status='pending'
+    ).order_by(BloodRequest.required_by).all()
+    
+    # Get donation history
+    history = DonationHistory.query.filter_by(patient_id=patient_id).all()
+    
+    return jsonify({
+        'patient_info': {
+            'name': patient.name,
+            'blood_type': patient.blood_type,
+            'next_transfusion': patient.next_transfusion.isoformat()
+        },
+        'pending_requests': len(upcoming_requests),
+        'total_transfusions': len(history),
+        'upcoming_requests': [{
+            'id': req.id,
+            'units_needed': req.units_needed,
+            'required_by': req.required_by.isoformat(),
+            'urgency': req.urgency_level,
+            'status': req.status
+        } for req in upcoming_requests]
+    })
+
+if __name__ == '__main__':
+    with app.app_context():
+        db.create_all()
+    app.run(debug=True)
